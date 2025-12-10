@@ -1,0 +1,158 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <regex.h>
+#include <errno.h>
+#include <stdbool.h>
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s [OPTIONS] PATTERN [FILE...]\n"
+        "Options:\n"
+        "  -i    Ignore case\n"
+        "  -n    Show line numbers\n"
+        "  -v    Invert match (show non-matching lines)\n"
+        "  -c    Print count of matching lines per file\n"
+        "  -H    Always print filename\n"
+        "  -h    Never print filename\n",
+        prog);
+    exit(2);
+}
+
+int process_stream(FILE *f, const char *fname, regex_t *re,
+                   bool show_fname, bool show_lineno, bool invert, bool count_only) {
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t read;
+    long lineno = 0;
+    long match_count = 0;
+
+    while ((read = getline(&line, &len, f)) != -1) {
+        lineno++;
+        // strip trailing newline? we will print raw line (with newline), so keep it.
+        int reti = regexec(re, line, 0, NULL, 0);
+        bool is_match = (reti == 0);
+        if (reti != 0 && reti != REG_NOMATCH) {
+            // regex execution error
+            char msgbuf[128];
+            regerror(reti, re, msgbuf, sizeof(msgbuf));
+            fprintf(stderr, "regex match error: %s\n", msgbuf);
+            free(line);
+            return -1;
+        }
+
+        bool pass = invert ? !is_match : is_match;
+        if (pass) {
+            match_count++;
+            if (!count_only) {
+                if (show_fname) {
+                    printf("%s:", fname);
+                }
+                if (show_lineno) {
+                    printf("%ld:", lineno);
+                }
+                // line already contains newline char
+                fputs(line, stdout);
+            }
+        }
+    }
+
+    free(line);
+
+    if (count_only) {
+        if (show_fname) printf("%s:", fname);
+        printf("%ld\n", match_count);
+    }
+
+    return (int)match_count;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) usage(argv[0]);
+
+    bool opt_i = false, opt_n = false, opt_v = false, opt_c = false;
+    bool opt_H = false, opt_h = false;
+
+    int argi = 1;
+    // parse simple single-letter options (no grouping of pattern prefixed by -e)
+    while (argi < argc && argv[argi][0] == '-' && argv[argi][1] != '\0') {
+        if (strcmp(argv[argi], "--") == 0) {
+            argi++;
+            break;
+        }
+        // treat as options string like -in
+        for (size_t k = 1; argv[argi][k] != '\0'; ++k) {
+            char ch = argv[argi][k];
+            switch (ch) {
+                case 'i': opt_i = true; break;
+                case 'n': opt_n = true; break;
+                case 'v': opt_v = true; break;
+                case 'c': opt_c = true; break;
+                case 'H': opt_H = true; break;
+                case 'h': opt_h = true; break;
+                default:
+                    fprintf(stderr, "Unknown option: -%c\n", ch);
+                    usage(argv[0]);
+            }
+        }
+        argi++;
+    }
+
+    if (argi >= argc) {
+        fprintf(stderr, "Missing PATTERN\n");
+        usage(argv[0]);
+    }
+
+    const char *pattern = argv[argi++];
+    int files_provided = argc - argi;
+
+    // compile regex
+    regex_t re;
+    int cflags = REG_EXTENDED; // use extended regex like grep -E
+    if (opt_i) cflags |= REG_ICASE;
+
+    int reti = regcomp(&re, pattern, cflags);
+    if (reti) {
+        char errbuf[256];
+        regerror(reti, &re, errbuf, sizeof(errbuf));
+        fprintf(stderr, "Failed to compile regex '%s': %s\n", pattern, errbuf);
+        return 2;
+    }
+
+    int total_matches = 0;
+    int exit_status = 1; // grep returns 0 on match, 1 if no matches, 2 on error
+
+    if (files_provided == 0) {
+        // read from stdin; filename for printing is "(standard input)"
+        const char *fname = "(standard input)";
+        bool show_fname = opt_H ? true : (opt_h ? false : false);
+        // if there are multiple files, grep prints filename; but for stdin only, do not print filename unless -H set.
+        // show_fname already false unless -H specified.
+        int matches = process_stream(stdin, fname, &re, show_fname, opt_n, opt_v, opt_c);
+        if (matches < 0) exit_status = 2;
+        else if (matches > 0) { total_matches += matches; exit_status = 0; }
+    } else {
+        bool multiple = (files_provided > 1);
+        for (int i = 0; i < files_provided; ++i) {
+            const char *fname = argv[argi + i];
+            FILE *f = fopen(fname, "r");
+            if (!f) {
+                fprintf(stderr, "Cannot open '%s': %s\n", fname, strerror(errno));
+                exit_status = 2;
+                continue;
+            }
+            bool show_fname;
+            if (opt_H) show_fname = true;
+            else if (opt_h) show_fname = false;
+            else show_fname = multiple; // print filename when many files provided
+
+            int matches = process_stream(f, fname, &re, show_fname, opt_n, opt_v, opt_c);
+            fclose(f);
+            if (matches < 0) exit_status = 2;
+            else if (matches > 0) { total_matches += matches; exit_status = 0; }
+        }
+    }
+
+    regfree(&re);
+    return exit_status;
+}
